@@ -1,28 +1,20 @@
 from datetime import datetime
-from typing import Any
-
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-VALID_TYPES = {
-    "dns",
-    "ct_log",
-    "registry",
-    "archive",
-    "scan",
-}
+VALID_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
 
 
-def invalid_response():
+def invalid():
     return {
         "verdict": "invalid",
         "confidence": "low",
-        "corroboratingSources": [],
+        "corroboratingSources": []
     }
 
 
-def parse_timestamp(value):
+def parse_time(value):
     if not isinstance(value, str):
         return None
 
@@ -38,50 +30,48 @@ def root():
 
 
 @app.post("/corroborate")
-def corroborate(body: Any):
+async def corroborate(request: Request):
 
-    # --------------------------------------------------
-    # RULE 1: INVALID
-    # --------------------------------------------------
+    # Read the raw JSON body ourselves.
+    try:
+        body = await request.json()
+    except Exception:
+        return invalid()
 
+    # Rule 1
     if not isinstance(body, dict):
-        return invalid_response()
+        return invalid()
 
     claim = body.get("claim")
 
     if not isinstance(claim, dict):
-        return invalid_response()
+        return invalid()
 
     claim_value = claim.get("value")
 
     if not isinstance(claim_value, str):
-        return invalid_response()
+        return invalid()
 
-    as_of = parse_timestamp(body.get("asOf"))
+    as_of = parse_time(body.get("asOf"))
 
     if as_of is None:
-        return invalid_response()
+        return invalid()
 
     staleness_days = body.get("stalenessDays")
 
-    # bool is technically an int in Python, but must not
-    # be accepted as a number here.
     if isinstance(staleness_days, bool):
-        return invalid_response()
+        return invalid()
 
     if not isinstance(staleness_days, (int, float)):
-        return invalid_response()
+        return invalid()
 
     sources = body.get("sources")
 
     if not isinstance(sources, list):
-        return invalid_response()
+        return invalid()
 
-    # --------------------------------------------------
-    # KEEP ONLY VALID + FRESH SOURCES
-    # --------------------------------------------------
-
-    fresh_sources = []
+    # Keep only valid and fresh sources
+    fresh = []
 
     for source in sources:
 
@@ -103,7 +93,7 @@ def corroborate(body: Any):
         if source.get("type") not in VALID_TYPES:
             continue
 
-        observed_at = parse_timestamp(source.get("observedAt"))
+        observed_at = parse_time(source["observedAt"])
 
         if observed_at is None:
             continue
@@ -112,85 +102,63 @@ def corroborate(body: Any):
             as_of - observed_at
         ).total_seconds() / 86400
 
-        # Anything older than the window is stale.
-        # Future observations are still fresh.
         if age_days <= staleness_days:
-            fresh_sources.append(source)
+            fresh.append(source)
 
-    # --------------------------------------------------
-    # RULE 2: AUTHORITATIVE CONTRADICTION
-    # --------------------------------------------------
+    # Rule 2: fresh authoritative contradiction
+    contradictions = [
+        source["id"]
+        for source in fresh
+        if source.get("authoritative") is True
+        and source["value"] != claim_value
+    ]
 
-    contradicting = []
-
-    for source in fresh_sources:
-
-        if (
-            source.get("authoritative") is True
-            and source["value"] != claim_value
-        ):
-            contradicting.append(source["id"])
-
-    if contradicting:
+    if contradictions:
         return {
             "verdict": "contradicted",
             "confidence": "low",
-            "corroboratingSources": sorted(contradicting),
+            "corroboratingSources": sorted(contradictions)
         }
 
-    # --------------------------------------------------
-    # RULE 3: SUPPORTING SOURCES
-    # --------------------------------------------------
-
+    # Rule 3: fresh sources agreeing with claim
     matching = [
         source
-        for source in fresh_sources
+        for source in fresh
         if source["value"] == claim_value
     ]
 
     # One representative per origin.
-    # Smallest lexicographical ID wins.
+    # Lexicographically smallest ID wins.
     representatives = {}
 
     for source in matching:
-
         origin = source["origin"]
 
-        if origin not in representatives:
-            representatives[origin] = source
-
-        elif source["id"] < representatives[origin]["id"]:
+        if (
+            origin not in representatives
+            or source["id"] < representatives[origin]["id"]
+        ):
             representatives[origin] = source
 
     reps = list(representatives.values())
 
     if len(reps) >= 2:
 
-        distinct_types = {
-            source["type"]
-            for source in reps
-        }
+        types = {source["type"] for source in reps}
 
-        if len(distinct_types) >= 2:
-            confidence = "high"
-        else:
-            confidence = "medium"
+        confidence = "high" if len(types) >= 2 else "medium"
 
         return {
             "verdict": "supported",
             "confidence": confidence,
             "corroboratingSources": sorted(
-                source["id"]
-                for source in reps
-            ),
+                source["id"] for source in reps
+            )
         }
 
-    # --------------------------------------------------
-    # RULE 4: UNVERIFIED
-    # --------------------------------------------------
-
+    # Rule 4
     return {
         "verdict": "unverified",
         "confidence": "low",
-        "corroboratingSources": [],
+        "corroboratingSources": []
     }
