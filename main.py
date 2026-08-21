@@ -1,15 +1,28 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI
-from pydantic import BaseModel
 
 app = FastAPI()
 
-VALID_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
+VALID_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan",
+}
 
 
-def parse_time(value: Any):
+def invalid_response():
+    return {
+        "verdict": "invalid",
+        "confidence": "low",
+        "corroboratingSources": [],
+    }
+
+
+def parse_timestamp(value):
     if not isinstance(value, str):
         return None
 
@@ -26,122 +39,158 @@ def root():
 
 @app.post("/corroborate")
 def corroborate(body: Any):
-    # Rule 1: invalid
+
+    # --------------------------------------------------
+    # RULE 1: INVALID
+    # --------------------------------------------------
+
     if not isinstance(body, dict):
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": []
-        }
+        return invalid_response()
 
     claim = body.get("claim")
+
     if not isinstance(claim, dict):
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": []
-        }
+        return invalid_response()
 
     claim_value = claim.get("value")
-    as_of = parse_time(body.get("asOf"))
+
+    if not isinstance(claim_value, str):
+        return invalid_response()
+
+    as_of = parse_timestamp(body.get("asOf"))
+
+    if as_of is None:
+        return invalid_response()
+
     staleness_days = body.get("stalenessDays")
+
+    # bool is technically an int in Python, but must not
+    # be accepted as a number here.
+    if isinstance(staleness_days, bool):
+        return invalid_response()
+
+    if not isinstance(staleness_days, (int, float)):
+        return invalid_response()
+
     sources = body.get("sources")
 
-    if (
-        not isinstance(claim_value, str)
-        or as_of is None
-        or isinstance(staleness_days, bool)
-        or not isinstance(staleness_days, (int, float))
-        or not isinstance(sources, list)
-    ):
-        return {
-            "verdict": "invalid",
-            "confidence": "low",
-            "corroboratingSources": []
-        }
+    if not isinstance(sources, list):
+        return invalid_response()
 
-    # Collect only valid + fresh sources
+    # --------------------------------------------------
+    # KEEP ONLY VALID + FRESH SOURCES
+    # --------------------------------------------------
+
     fresh_sources = []
 
     for source in sources:
+
         if not isinstance(source, dict):
             continue
 
-        required_strings = ["id", "origin", "value", "observedAt"]
+        if not isinstance(source.get("id"), str):
+            continue
 
-        if any(not isinstance(source.get(k), str) for k in required_strings):
+        if not isinstance(source.get("origin"), str):
+            continue
+
+        if not isinstance(source.get("value"), str):
+            continue
+
+        if not isinstance(source.get("observedAt"), str):
             continue
 
         if source.get("type") not in VALID_TYPES:
             continue
 
-        observed_at = parse_time(source["observedAt"])
+        observed_at = parse_timestamp(source.get("observedAt"))
+
         if observed_at is None:
             continue
 
-        # Future observations are not stale
-        age_seconds = (as_of - observed_at).total_seconds()
-        age_days = age_seconds / 86400
+        age_days = (
+            as_of - observed_at
+        ).total_seconds() / 86400
 
+        # Anything older than the window is stale.
+        # Future observations are still fresh.
         if age_days <= staleness_days:
             fresh_sources.append(source)
 
-    # Rule 2: authoritative contradiction
-    contradicting = [
-        s for s in fresh_sources
-        if s.get("authoritative") is True
-        and s["value"] != claim_value
-    ]
+    # --------------------------------------------------
+    # RULE 2: AUTHORITATIVE CONTRADICTION
+    # --------------------------------------------------
+
+    contradicting = []
+
+    for source in fresh_sources:
+
+        if (
+            source.get("authoritative") is True
+            and source["value"] != claim_value
+        ):
+            contradicting.append(source["id"])
 
     if contradicting:
         return {
             "verdict": "contradicted",
             "confidence": "low",
-            "corroboratingSources": sorted(
-                s["id"] for s in contradicting
-            )
+            "corroboratingSources": sorted(contradicting),
         }
 
-    # Rule 3: sources agreeing with claim
+    # --------------------------------------------------
+    # RULE 3: SUPPORTING SOURCES
+    # --------------------------------------------------
+
     matching = [
-        s for s in fresh_sources
-        if s["value"] == claim_value
+        source
+        for source in fresh_sources
+        if source["value"] == claim_value
     ]
 
     # One representative per origin.
+    # Smallest lexicographical ID wins.
     representatives = {}
 
     for source in matching:
+
         origin = source["origin"]
 
-        if (
-            origin not in representatives
-            or source["id"] < representatives[origin]["id"]
-        ):
+        if origin not in representatives:
+            representatives[origin] = source
+
+        elif source["id"] < representatives[origin]["id"]:
             representatives[origin] = source
 
     reps = list(representatives.values())
 
     if len(reps) >= 2:
-        distinct_types = {s["type"] for s in reps}
 
-        confidence = (
-            "high"
-            if len(distinct_types) >= 2
-            else "medium"
-        )
+        distinct_types = {
+            source["type"]
+            for source in reps
+        }
+
+        if len(distinct_types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
 
         return {
             "verdict": "supported",
             "confidence": confidence,
             "corroboratingSources": sorted(
-                s["id"] for s in reps
-            )
+                source["id"]
+                for source in reps
+            ),
         }
 
-    # Rule 4
+    # --------------------------------------------------
+    # RULE 4: UNVERIFIED
+    # --------------------------------------------------
+
     return {
         "verdict": "unverified",
         "confidence": "low",
-        "corroboratingSources": []
+        "corroboratingSources": [],
     }
